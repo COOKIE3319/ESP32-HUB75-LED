@@ -1,0 +1,46 @@
+
+此目录用于存放项目特定的（私有）库。
+PlatformIO 会将它们编译成静态库并链接到可执行文件中。
+
+每个库的源代码都应该放在单独的目录中。
+("lib/your_library_name/[Code]").
+
+例如，请参阅以下示例库 `Foo` 和 `Bar` 的结构：
+
+|--lib
+|  |
+|  |--Bar
+|  |  |--docs
+|  |  |--examples
+|  |  |--src
+|  |     |- Bar.c
+|  |     |- Bar.h
+|  |  |- library.json (可选，用于自定义构建选项等) https://docs.platformio.org/page/librarymanager/config.html
+|  |
+|  |--Foo
+|  |  |- Foo.c
+|  |  |- Foo.h
+|  |
+|  |- README --> THIS FILE
+|
+|- platformio.ini
+|--src
+   |- main.c
+
+使用 Foo 和 Bar 的 `src/main.c` 示例内容：
+```
+#include <Foo.h>
+#include <Bar.h>
+
+int main (void)
+{
+  ...
+}
+
+```
+
+PlatformIO 库依赖项查找器将自动查找依赖项
+通过扫描项目源文件来获取库。
+
+有关 PlatformIO 库依赖项查找器的更多信息
+- https://docs.platformio.org/page/librarymanager/ldf.html
