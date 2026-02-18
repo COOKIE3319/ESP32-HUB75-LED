@@ -15,6 +15,7 @@
 #include "mbedtls/base64.h"
 #include "soc/gpio_reg.h"
 #include "esp_task_wdt.h"
+#include "setup_image.h"
 
 // ==================== 引脚定义 ====================
 // 注意: 面板内部RGB接线与HUB75标注不同，已根据实测校正
@@ -459,7 +460,16 @@ void setup() {
     // 开机测试图案 (扫描任务已启动，可以看到显示)
     fillTestPattern();
 
-    // 连接WiFi
+    // 显示启动图片 (setup.png)
+    Serial.println("【显示】加载启动图片...");
+    memcpy_P(frameBuffer, setup_image_data, sizeof(frameBuffer));
+    // 应用Gamma校正
+    for (size_t i = 0; i < sizeof(frameBuffer); i++) {
+        frameBuffer[i] = gammaTable[frameBuffer[i]];
+    }
+    Serial.println("【显示】启动图片已显示");
+
+    // 连接WiFi (启动图片在连接期间持续显示)
     connectWiFi();
 
     // 在LED屏幕上显示IP地址
