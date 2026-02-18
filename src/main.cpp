@@ -210,6 +210,103 @@ void fillTestPattern() {
     Serial.println("【显示】测试完成，屏幕已清空");
 }
 
+// ==================== 5x7 点阵字体 ====================
+// 字符: 0-9, '.', ':'，用于显示 IP 地址
+static const uint8_t font5x7[][7] = {
+    // '0'
+    {0b01110, 0b10001, 0b10011, 0b10101, 0b11001, 0b10001, 0b01110},
+    // '1'
+    {0b00100, 0b01100, 0b00100, 0b00100, 0b00100, 0b00100, 0b01110},
+    // '2'
+    {0b01110, 0b10001, 0b00001, 0b00110, 0b01000, 0b10000, 0b11111},
+    // '3'
+    {0b01110, 0b10001, 0b00001, 0b00110, 0b00001, 0b10001, 0b01110},
+    // '4'
+    {0b00010, 0b00110, 0b01010, 0b10010, 0b11111, 0b00010, 0b00010},
+    // '5'
+    {0b11111, 0b10000, 0b11110, 0b00001, 0b00001, 0b10001, 0b01110},
+    // '6'
+    {0b00110, 0b01000, 0b10000, 0b11110, 0b10001, 0b10001, 0b01110},
+    // '7'
+    {0b11111, 0b00001, 0b00010, 0b00100, 0b01000, 0b01000, 0b01000},
+    // '8'
+    {0b01110, 0b10001, 0b10001, 0b01110, 0b10001, 0b10001, 0b01110},
+    // '9'
+    {0b01110, 0b10001, 0b10001, 0b01111, 0b00001, 0b00010, 0b01100},
+    // '.' (index 10)
+    {0b00000, 0b00000, 0b00000, 0b00000, 0b00000, 0b01100, 0b01100},
+    // ':' (index 11)
+    {0b00000, 0b01100, 0b01100, 0b00000, 0b01100, 0b01100, 0b00000},
+};
+
+int fontIndex(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c == '.') return 10;
+    if (c == ':') return 11;
+    return -1;
+}
+
+// 在帧缓冲区中绘制单个像素
+void setPixel(int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    if (x < 0 || x >= DISPLAY_WIDTH || y < 0 || y >= DISPLAY_HEIGHT) return;
+    int idx = (y * DISPLAY_WIDTH + x) * 3;
+    frameBuffer[idx]     = r;
+    frameBuffer[idx + 1] = g;
+    frameBuffer[idx + 2] = b;
+}
+
+// 绘制单个字符 (5x7), 返回下一个字符的 x 坐标
+int drawChar(char c, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    int idx = fontIndex(c);
+    if (idx < 0) return x + 3; // 空格/未知字符跳过3像素
+    int charWidth = (c == '.' || c == ':') ? 3 : 5; // 窄字符用3像素宽
+    for (int row = 0; row < 7; row++) {
+        for (int col = 0; col < 5; col++) {
+            if (font5x7[idx][row] & (1 << (4 - col))) {
+                setPixel(x + col, y + row, r, g, b);
+            }
+        }
+    }
+    return x + charWidth + 1; // 字符间距1像素
+}
+
+// 绘制字符串, 返回总宽度
+int drawString(const char* str, int x, int y, uint8_t r, uint8_t g, uint8_t b) {
+    int startX = x;
+    while (*str) {
+        x = drawChar(*str, x, y, r, g, b);
+        str++;
+    }
+    return x - startX;
+}
+
+// 计算字符串像素宽度 (不绘制)
+int measureString(const char* str) {
+    int w = 0;
+    while (*str) {
+        char c = *str;
+        if (c == '.' || c == ':') w += 4; // 3宽 + 1间距
+        else w += 6; // 5宽 + 1间距
+        str++;
+    }
+    return w > 0 ? w - 1 : 0; // 去掉最后的间距
+}
+
+// 在屏幕上居中显示 IP 地址
+void displayIP(const char* ip) {
+    fillColor(0, 0, 0); // 清屏
+
+    // 计算居中位置
+    int textW = measureString(ip);
+    int x = (DISPLAY_WIDTH - textW) / 2;
+    int y = (DISPLAY_HEIGHT - 7) / 2; // 字体高度7像素，垂直居中
+
+    // 绿色显示IP地址
+    drawString(ip, x, y, 255, 255, 255);
+
+    Serial.printf("【显示】IP地址已显示在屏幕上: %s\n", ip);
+}
+
 // ==================== CORS 头部 ====================
 void addCORSHeaders() {
     server.sendHeader("Access-Control-Allow-Origin", "*");
@@ -364,6 +461,9 @@ void setup() {
 
     // 连接WiFi
     connectWiFi();
+
+    // 在LED屏幕上显示IP地址
+    displayIP(WiFi.localIP().toString().c_str());
 
     // 启动mDNS服务
     if (MDNS.begin("esp32-led")) {
