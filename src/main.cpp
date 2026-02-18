@@ -41,6 +41,7 @@
 #define DISPLAY_HEIGHT PANEL_HEIGHT                  // 32
 #define SCAN_ROWS      16                            // 1/16扫描
 #define COLOR_DEPTH    6                             // 每通道6位色深 (BCM)
+#define BRIGHTNESS     127                            // 全局亮度 (0-255)，30≈12%亮度
 
 // ==================== WiFi 配置 ====================
 const char* ssid     = "CMCC-Apfb";
@@ -76,9 +77,11 @@ const uint32_t D_MASK    = (1UL << D_PIN);
 void initGammaTable() {
     float gamma = 2.5f;
     for (int i = 0; i < 256; i++) {
-        gammaTable[i] = (uint8_t)(powf((float)i / 255.0f, gamma) * 255.0f + 0.5f);
+        // Gamma校正后再乘以亮度系数，有效限制最大输出值
+        float val = powf((float)i / 255.0f, gamma) * (float)BRIGHTNESS + 0.5f;
+        gammaTable[i] = (uint8_t)(val > 255.0f ? 255 : val);
     }
-    Serial.println("【初始化】Gamma校正表已生成 (γ=2.5)");
+    Serial.printf("【初始化】Gamma校正表已生成 (γ=2.5, 亮度=%d/255≈%d%%)\n", BRIGHTNESS, BRIGHTNESS * 100 / 255);
 }
 
 // ==================== HUB75 引脚初始化 ====================
@@ -110,13 +113,16 @@ inline void setRowAddress(uint8_t row) {
     else            REG_WRITE(GPIO_OUT_W1TC_REG, D_MASK);
 }
 
-// ==================== LED显示扫描任务 (Core 0) ====================
+// ==================== LED显示扫描任务 (Core 1 独占) ====================
 void displayScanTask(void *param) {
     // 将此任务从看门狗监控中移除，防止因扫描占用CPU导致WDT重启
     esp_task_wdt_delete(NULL);
-    Serial.println("【显示】LED扫描任务已在Core 0启动 (已排除WDT监控)");
+    Serial.println("【显示】LED扫描任务已在Core 1启动 (独占核心, 已排除WDT监控)");
 
-    const uint16_t baseDelay = 3; // 最低位延时(微秒)，值越大亮度越高但刷新率降低
+    const uint16_t baseDelay = 1; // 最低位延时(微秒)，值越大亮度越高但刷新率降低
+
+    // 初始启用输出 (OE LOW)
+    REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);
 
     // ====================================================================
     // 优化扫描: 利用 HUB75 移位寄存器与输出锁存器独立的特性
@@ -152,14 +158,13 @@ void displayScanTask(void *param) {
                     REG_WRITE(GPIO_OUT_W1TC_REG, CLK_MASK);
                 }
 
-                // ── 阶段2: 极短消隐 → 锁存 → 恢复显示 ──────────────
-                // 消隐时间仅为行地址设置+锁存脉冲 (~200ns)
-                REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);   // OE↑ 消隐
+                // ── 阶段2: 锁存切换 (不消隐，消除闪烁) ─────────────
+                // 直接切换行地址并锁存，OE保持LOW不中断显示
+                // 代价: 行切换瞬间可能有极轻微鬼影，但消除了可见闪烁
                 setRowAddress(row);
                 REG_WRITE(GPIO_OUT_W1TS_REG, LAT_MASK);   // LAT↑ 锁存
                 __asm__ __volatile__("nop");
                 REG_WRITE(GPIO_OUT_W1TC_REG, LAT_MASK);   // LAT↓
-                REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);   // OE↓ 恢复显示
 
                 // ── 阶段3: BCM位权延时 (显示期间) ────────────────────
                 // OE保持LOW，显示继续，直到下一次移位开始
@@ -168,36 +173,41 @@ void displayScanTask(void *param) {
                 // OE LOW (显示中) 的状态下进行，实现移位与显示的重叠。
             }
         }
-        // 帧结束: 消隐后让出CPU
-        REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
-        // 每帧结束让出CPU时间给WiFi栈和idle task
+        // 帧结束: 让出CPU时间给WiFi栈和idle task
         // 使用 vTaskDelay(1) 确保 idle task 可以运行 (喂系统看门狗)
         vTaskDelay(1);
     }
 }
 
 // ==================== 测试图案 ====================
-void fillTestPattern() {
-    Serial.println("【显示】生成开机测试图案...");
-    for (int y = 0; y < DISPLAY_HEIGHT; y++) {
-        for (int x = 0; x < DISPLAY_WIDTH; x++) {
-            int idx = (y * DISPLAY_WIDTH + x) * 3;
-            if (x < 32) {
-                // 红色区
-                frameBuffer[idx] = 255; frameBuffer[idx + 1] = 0; frameBuffer[idx + 2] = 0;
-            } else if (x < 64) {
-                // 绿色区
-                frameBuffer[idx] = 0; frameBuffer[idx + 1] = 255; frameBuffer[idx + 2] = 0;
-            } else if (x < 96) {
-                // 蓝色区
-                frameBuffer[idx] = 0; frameBuffer[idx + 1] = 0; frameBuffer[idx + 2] = 255;
-            } else {
-                // 白色区
-                frameBuffer[idx] = 255; frameBuffer[idx + 1] = 255; frameBuffer[idx + 2] = 255;
-            }
-        }
+void fillColor(uint8_t r, uint8_t g, uint8_t b) {
+    for (int i = 0; i < DISPLAY_WIDTH * DISPLAY_HEIGHT; i++) {
+        frameBuffer[i * 3]     = r;
+        frameBuffer[i * 3 + 1] = g;
+        frameBuffer[i * 3 + 2] = b;
     }
-    Serial.println("【显示】测试图案已生成 (红/绿/蓝/白 四色条)");
+}
+
+void fillTestPattern() {
+    Serial.println("【显示】开机测试: 红→绿→蓝→白，每色0.5秒");
+
+    const uint8_t colors[][3] = {
+        {255, 0, 0},     // 红
+        {0, 255, 0},     // 绿
+        {0, 0, 255},     // 蓝
+        {255, 255, 255}  // 白
+    };
+    const char* names[] = {"红", "绿", "蓝", "白"};
+
+    for (int c = 0; c < 4; c++) {
+        fillColor(colors[c][0], colors[c][1], colors[c][2]);
+        Serial.printf("【显示】测试: %s\n", names[c]);
+        delay(500);
+    }
+
+    // 测试结束后清屏
+    fillColor(0, 0, 0);
+    Serial.println("【显示】测试完成，屏幕已清空");
 }
 
 // ==================== CORS 头部 ====================
@@ -335,20 +345,22 @@ void setup() {
     // 初始化HUB75引脚
     initHUB75Pins();
 
-    // 生成开机测试图案
-    fillTestPattern();
-
-    // 启动显示扫描任务 (Core 0, 与WiFi共存但WiFi优先级更高)
+    // 启动显示扫描任务 (Core 1, 独占核心，不受WiFi中断干扰)
+    // Core 0: WiFi/BT协议栈 + Arduino loop (Web服务器)
+    // Core 1: LED扫描任务 (独占，保证刷新稳定)
     xTaskCreatePinnedToCore(
         displayScanTask,   // 任务函数
         "DisplayTask",     // 任务名称
         4096,              // 堆栈大小
         NULL,              // 参数
-        2,                 // 优先级 (WiFi=23, 不会影响WiFi)
+        configMAX_PRIORITIES - 1, // 最高优先级，确保不被抢占
         NULL,              // 任务句柄
-        0                  // 绑定到Core 0
+        1                  // 绑定到Core 1 (独占)
     );
-    Serial.println("【系统】显示扫描任务已创建");
+    Serial.println("【系统】显示扫描任务已创建 (Core 1独占)");
+
+    // 开机测试图案 (扫描任务已启动，可以看到显示)
+    fillTestPattern();
 
     // 连接WiFi
     connectWiFi();
