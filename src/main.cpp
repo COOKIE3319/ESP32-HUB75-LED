@@ -42,7 +42,13 @@
 #define DISPLAY_HEIGHT PANEL_HEIGHT                  // 32
 #define SCAN_ROWS      16                            // 1/16扫描
 #define COLOR_DEPTH    6                             // 每通道6位色深 (BCM)
-#define BRIGHTNESS     127                            // 全局亮度 (0-255)，30≈12%亮度
+#define BRIGHTNESS     127                           // 全局亮度 (0-255)，通过BCM时序缩放
+#define DEFAULT_GAMMA  1.0f                          // 图片通常已是sRGB，避免暗部二次压暗
+#define MIN_GAMMA      0.6f
+#define MAX_GAMMA      2.2f
+#define BLACK_CLIP     4                             // Gamma后RGB均<=该值时视为纯黑
+#define DARK_NEUTRAL_MAX 14                          // 近黑范围：抑制偏色（尤其红噪点）
+#define DARK_CHROMA_TOL 2                            // 近黑允许的通道差
 
 // ==================== WiFi 配置 ====================
 const char* ssid     = "CMCC-Apfb";
@@ -50,11 +56,64 @@ const char* password = "d4mk9AE2";
 
 // ==================== 全局变量 ====================
 uint8_t frameBuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT * 3] = {0};
+uint8_t rawFrameBuffer[DISPLAY_WIDTH * DISPLAY_HEIGHT * 3] = {0};
+float currentGamma = DEFAULT_GAMMA;
+bool hasRawFrame = false;
 
 WebServer server(80);
 
 // Gamma校正表 (gamma=2.5，改善LED上的图片显示效果)
 uint8_t gammaTable[256];
+
+// 将8位颜色量化为面板可用的6位，并回扩展到8位供位平面提取
+inline uint8_t quantizeToPanel6Bit(uint8_t value) {
+    uint8_t level6 = (uint16_t(value) * 63 + 127) / 255; // 四舍五入
+    return (uint8_t)((level6 << 2) | (level6 >> 4));
+}
+
+inline float clampGamma(float gamma) {
+    if (gamma < MIN_GAMMA) return MIN_GAMMA;
+    if (gamma > MAX_GAMMA) return MAX_GAMMA;
+    return gamma;
+}
+
+void applyColorPipeline(const uint8_t* src, uint8_t* dst, size_t len) {
+    for (size_t i = 0; i < len; i += 3) {
+        uint8_t r = gammaTable[src[i]];
+        uint8_t g = gammaTable[src[i + 1]];
+        uint8_t b = gammaTable[src[i + 2]];
+
+        uint8_t maxCh = max(r, max(g, b));
+        uint8_t minCh = min(r, min(g, b));
+
+        if (maxCh <= BLACK_CLIP) {
+            dst[i] = 0;
+            dst[i + 1] = 0;
+            dst[i + 2] = 0;
+            continue;
+        }
+
+        // 近黑区抑制偏色：若低亮区通道差过大，按最暗通道中性化
+        if (maxCh <= DARK_NEUTRAL_MAX && (uint8_t)(maxCh - minCh) > DARK_CHROMA_TOL) {
+            r = minCh;
+            g = minCh;
+            b = minCh;
+        }
+
+        dst[i] = quantizeToPanel6Bit(r);
+        dst[i + 1] = quantizeToPanel6Bit(g);
+        dst[i + 2] = quantizeToPanel6Bit(b);
+    }
+}
+
+void rebuildGammaTable(float gamma) {
+    currentGamma = clampGamma(gamma);
+    for (int i = 0; i < 256; i++) {
+        float val = powf((float)i / 255.0f, currentGamma) * 255.0f + 0.5f;
+        gammaTable[i] = (uint8_t)(val > 255.0f ? 255 : val);
+    }
+    Serial.printf("【设置】Gamma已更新: %.2f\n", currentGamma);
+}
 
 // GPIO 位掩码 (所有数据引脚均在GPIO 0-31范围)
 const uint32_t R1_MASK  = (1UL << R1_PIN);
@@ -76,13 +135,8 @@ const uint32_t D_MASK    = (1UL << D_PIN);
 
 // ==================== Gamma校正初始化 ====================
 void initGammaTable() {
-    float gamma = 2.5f;
-    for (int i = 0; i < 256; i++) {
-        // Gamma校正后再乘以亮度系数，有效限制最大输出值
-        float val = powf((float)i / 255.0f, gamma) * (float)BRIGHTNESS + 0.5f;
-        gammaTable[i] = (uint8_t)(val > 255.0f ? 255 : val);
-    }
-    Serial.printf("【初始化】Gamma校正表已生成 (γ=2.5, 亮度=%d/255≈%d%%)\n", BRIGHTNESS, BRIGHTNESS * 100 / 255);
+    rebuildGammaTable(DEFAULT_GAMMA);
+    Serial.printf("【初始化】Gamma校正表已生成 (γ=%.2f)\n", currentGamma);
 }
 
 // ==================== HUB75 引脚初始化 ====================
@@ -120,25 +174,21 @@ void displayScanTask(void *param) {
     esp_task_wdt_delete(NULL);
     Serial.println("【显示】LED扫描任务已在Core 1启动 (独占核心, 已排除WDT监控)");
 
-    const uint16_t baseDelay = 1; // 最低位延时(微秒)，值越大亮度越高但刷新率降低
+    const uint16_t baseDelay = 1; // 最低位延时(微秒)
 
-    // 初始启用输出 (OE LOW)
-    REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);
-
-    // ====================================================================
-    // 优化扫描: 利用 HUB75 移位寄存器与输出锁存器独立的特性
-    // 在上一行/位仍在显示 (OE LOW) 时，将下一行/位的数据移入移位寄存器，
-    // 仅在锁存切换瞬间极短消隐 (~200ns)，消除可见的暗带扫描线。
-    // ====================================================================
+    // 初始关闭输出 (OE HIGH)
+    REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
 
     while (true) {
         for (uint8_t row = 0; row < SCAN_ROWS; row++) {
             for (uint8_t bit = 0; bit < COLOR_DEPTH; bit++) {
                 uint8_t bitPos = bit + (8 - COLOR_DEPTH);
 
-                // ── 阶段1: 移位 ──────────────────────────────────────
+                // ── 阶段1: 关输出 + 移位 ─────────────────────────────
+                // 关输出后再移位，避免移位过程串扰造成颜色失真
+                REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
+
                 // 将本行本位的像素数据移入移位寄存器 (128列)
-                // 此时输出锁存器仍在显示上一行/位的数据，不受影响
                 for (uint16_t col = 0; col < DISPLAY_WIDTH; col++) {
                     uint16_t idxTop = (row * DISPLAY_WIDTH + col) * 3;
                     uint16_t idxBot = ((row + SCAN_ROWS) * DISPLAY_WIDTH + col) * 3;
@@ -159,21 +209,25 @@ void displayScanTask(void *param) {
                     REG_WRITE(GPIO_OUT_W1TC_REG, CLK_MASK);
                 }
 
-                // ── 阶段2: 锁存切换 (不消隐，消除闪烁) ─────────────
-                // 直接切换行地址并锁存，OE保持LOW不中断显示
-                // 代价: 行切换瞬间可能有极轻微鬼影，但消除了可见闪烁
+                // ── 阶段2: 锁存切换 ────────────────────────────────
                 setRowAddress(row);
                 REG_WRITE(GPIO_OUT_W1TS_REG, LAT_MASK);   // LAT↑ 锁存
                 __asm__ __volatile__("nop");
                 REG_WRITE(GPIO_OUT_W1TC_REG, LAT_MASK);   // LAT↓
+                REG_WRITE(GPIO_OUT_W1TC_REG, DATA_MASK);  // 关数据线，降低耦合串扰
+                __asm__ __volatile__("nop");
+                __asm__ __volatile__("nop");
 
                 // ── 阶段3: BCM位权延时 (显示期间) ────────────────────
-                // OE保持LOW，显示继续，直到下一次移位开始
-                delayMicroseconds(baseDelay << bit);
-                // 注意: 不在此处 OE HIGH! 下一次循环的移位阶段会在
-                // OE LOW (显示中) 的状态下进行，实现移位与显示的重叠。
+                // 仅在稳定数据下开启输出
+                REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);
+                uint16_t planeDelay = ((baseDelay << bit) * BRIGHTNESS + 127) / 255;
+                if (planeDelay < 1) planeDelay = 1;
+                delayMicroseconds(planeDelay);
             }
         }
+        // 关键: 帧结束时关闭输出，避免最后一行在vTaskDelay期间被额外点亮
+        REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
         // 帧结束: 让出CPU时间给WiFi栈和idle task
         // 使用 vTaskDelay(1) 确保 idle task 可以运行 (喂系统看门狗)
         vTaskDelay(1);
@@ -335,8 +389,63 @@ void handleStatus() {
     json += "\"width\":" + String(DISPLAY_WIDTH) + ",";
     json += "\"height\":" + String(DISPLAY_HEIGHT) + ",";
     json += "\"colorDepth\":" + String(COLOR_DEPTH) + ",";
+    json += "\"gamma\":" + String(currentGamma, 2) + ",";
     json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
     json += "\"rssi\":" + String(WiFi.RSSI());
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handleGetSettings() {
+    addCORSHeaders();
+    String json = "{";
+    json += "\"gamma\":" + String(currentGamma, 2) + ",";
+    json += "\"gammaMin\":" + String(MIN_GAMMA, 2) + ",";
+    json += "\"gammaMax\":" + String(MAX_GAMMA, 2) + ",";
+    json += "\"brightness\":" + String(BRIGHTNESS);
+    json += "}";
+    server.send(200, "application/json", json);
+}
+
+void handleSetSettings() {
+    addCORSHeaders();
+
+    if (server.method() != HTTP_POST) {
+        server.send(405, "application/json", "{\"error\":\"仅支持POST方法\"}");
+        return;
+    }
+
+    String gammaStr = server.arg("gamma");
+    if (gammaStr.length() == 0) {
+        String body = server.arg("plain");
+        body.trim();
+        gammaStr = body;
+    }
+
+    if (gammaStr.length() == 0) {
+        server.send(400, "application/json", "{\"error\":\"缺少gamma参数\"}");
+        return;
+    }
+
+    char* endPtr = nullptr;
+    float parsedGamma = strtof(gammaStr.c_str(), &endPtr);
+    if (endPtr == gammaStr.c_str()) {
+        server.send(400, "application/json", "{\"error\":\"gamma参数格式错误\"}");
+        return;
+    }
+
+    float clampedGamma = clampGamma(parsedGamma);
+    bool wasClamped = (clampedGamma != parsedGamma);
+    rebuildGammaTable(clampedGamma);
+
+    if (hasRawFrame) {
+        applyColorPipeline(rawFrameBuffer, frameBuffer, sizeof(frameBuffer));
+    }
+
+    String json = "{";
+    json += "\"status\":\"ok\",";
+    json += "\"gamma\":" + String(currentGamma, 2) + ",";
+    json += "\"clamped\":" + String(wasClamped ? "true" : "false");
     json += "}";
     server.send(200, "application/json", json);
 }
@@ -361,9 +470,9 @@ void handleUpload() {
     const size_t expectedSize = DISPLAY_WIDTH * DISPLAY_HEIGHT * 3; // 12288
     size_t decodedLen = 0;
 
-    // Base64解码直接写入帧缓冲区
+    // Base64解码写入原始帧缓冲区
     int ret = mbedtls_base64_decode(
-        frameBuffer, sizeof(frameBuffer), &decodedLen,
+        rawFrameBuffer, sizeof(rawFrameBuffer), &decodedLen,
         (const unsigned char*)body.c_str(), body.length()
     );
 
@@ -381,10 +490,9 @@ void handleUpload() {
         return;
     }
 
-    // 应用Gamma校正
-    for (size_t i = 0; i < expectedSize; i++) {
-        frameBuffer[i] = gammaTable[frameBuffer[i]];
-    }
+    // 应用Gamma校正并量化到面板6位色深
+    applyColorPipeline(rawFrameBuffer, frameBuffer, expectedSize);
+    hasRawFrame = true;
 
     server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"图片已更新\"}");
     Serial.println("【图片】新图片已接收并显示 ✓");
@@ -393,6 +501,8 @@ void handleUpload() {
 void handleClearScreen() {
     addCORSHeaders();
     memset(frameBuffer, 0, sizeof(frameBuffer));
+    memset(rawFrameBuffer, 0, sizeof(rawFrameBuffer));
+    hasRawFrame = false;
     server.send(200, "application/json", "{\"status\":\"ok\",\"message\":\"屏幕已清空\"}");
     Serial.println("【显示】屏幕已清空");
 }
@@ -462,11 +572,10 @@ void setup() {
 
     // 显示启动图片 (setup.png)
     Serial.println("【显示】加载启动图片...");
-    memcpy_P(frameBuffer, setup_image_data, sizeof(frameBuffer));
-    // 应用Gamma校正
-    for (size_t i = 0; i < sizeof(frameBuffer); i++) {
-        frameBuffer[i] = gammaTable[frameBuffer[i]];
-    }
+    memcpy_P(rawFrameBuffer, setup_image_data, sizeof(rawFrameBuffer));
+    // 应用Gamma校正并量化到面板6位色深
+    applyColorPipeline(rawFrameBuffer, frameBuffer, sizeof(frameBuffer));
+    hasRawFrame = true;
     Serial.println("【显示】启动图片已显示");
 
     // 连接WiFi (启动图片在连接期间持续显示)
@@ -474,6 +583,7 @@ void setup() {
 
     // 在LED屏幕上显示IP地址
     displayIP(WiFi.localIP().toString().c_str());
+    hasRawFrame = false;
 
     // 启动mDNS服务
     if (MDNS.begin("esp32-led")) {
@@ -484,6 +594,8 @@ void setup() {
     // 配置Web服务器路由
     server.on("/", HTTP_GET, handleRoot);
     server.on("/status", HTTP_GET, handleStatus);
+    server.on("/settings", HTTP_GET, handleGetSettings);
+    server.on("/settings", HTTP_POST, handleSetSettings);
     server.on("/upload", HTTP_POST, handleUpload);
     server.on("/clear", HTTP_POST, handleClearScreen);
 
