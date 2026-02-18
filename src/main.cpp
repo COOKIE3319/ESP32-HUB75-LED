@@ -118,20 +118,24 @@ void displayScanTask(void *param) {
 
     const uint16_t baseDelay = 3; // 最低位延时(微秒)，值越大亮度越高但刷新率降低
 
+    // ====================================================================
+    // 优化扫描: 利用 HUB75 移位寄存器与输出锁存器独立的特性
+    // 在上一行/位仍在显示 (OE LOW) 时，将下一行/位的数据移入移位寄存器，
+    // 仅在锁存切换瞬间极短消隐 (~200ns)，消除可见的暗带扫描线。
+    // ====================================================================
+
     while (true) {
         for (uint8_t row = 0; row < SCAN_ROWS; row++) {
             for (uint8_t bit = 0; bit < COLOR_DEPTH; bit++) {
-                // 计算提取的位位置 (取高6位: bit2~bit7)
                 uint8_t bitPos = bit + (8 - COLOR_DEPTH);
 
-                // 逐像素移入数据 (128列)
+                // ── 阶段1: 移位 ──────────────────────────────────────
+                // 将本行本位的像素数据移入移位寄存器 (128列)
+                // 此时输出锁存器仍在显示上一行/位的数据，不受影响
                 for (uint16_t col = 0; col < DISPLAY_WIDTH; col++) {
-                    // 上半部分 (行 0~15)
                     uint16_t idxTop = (row * DISPLAY_WIDTH + col) * 3;
-                    // 下半部分 (行 16~31)
                     uint16_t idxBot = ((row + SCAN_ROWS) * DISPLAY_WIDTH + col) * 3;
 
-                    // 组装数据位
                     uint32_t dataVal = 0;
                     if ((frameBuffer[idxTop]     >> bitPos) & 1) dataVal |= R1_MASK;
                     if ((frameBuffer[idxTop + 1] >> bitPos) & 1) dataVal |= G1_MASK;
@@ -140,38 +144,32 @@ void displayScanTask(void *param) {
                     if ((frameBuffer[idxBot + 1] >> bitPos) & 1) dataVal |= G2_MASK;
                     if ((frameBuffer[idxBot + 2] >> bitPos) & 1) dataVal |= B2_MASK;
 
-                    // 设置数据引脚
-                    REG_WRITE(GPIO_OUT_W1TC_REG, DATA_MASK); // 清除所有数据引脚
-                    REG_WRITE(GPIO_OUT_W1TS_REG, dataVal);   // 设置需要的引脚
-
-                    // 时钟脉冲 (带微小延时确保数据建立)
+                    REG_WRITE(GPIO_OUT_W1TC_REG, DATA_MASK);
+                    REG_WRITE(GPIO_OUT_W1TS_REG, dataVal);
                     __asm__ __volatile__("nop");
-                    REG_WRITE(GPIO_OUT_W1TS_REG, CLK_MASK);  // CLK↑
+                    REG_WRITE(GPIO_OUT_W1TS_REG, CLK_MASK);
                     __asm__ __volatile__("nop");
-                    REG_WRITE(GPIO_OUT_W1TC_REG, CLK_MASK);  // CLK↓
+                    REG_WRITE(GPIO_OUT_W1TC_REG, CLK_MASK);
                 }
 
-                // 禁用输出 (防鬼影)
-                REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
-
-                // 设置行地址
+                // ── 阶段2: 极短消隐 → 锁存 → 恢复显示 ──────────────
+                // 消隐时间仅为行地址设置+锁存脉冲 (~200ns)
+                REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);   // OE↑ 消隐
                 setRowAddress(row);
-
-                // 锁存数据
-                REG_WRITE(GPIO_OUT_W1TS_REG, LAT_MASK);
+                REG_WRITE(GPIO_OUT_W1TS_REG, LAT_MASK);   // LAT↑ 锁存
                 __asm__ __volatile__("nop");
-                REG_WRITE(GPIO_OUT_W1TC_REG, LAT_MASK);
+                REG_WRITE(GPIO_OUT_W1TC_REG, LAT_MASK);   // LAT↓
+                REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);   // OE↓ 恢复显示
 
-                // 启用输出 (开始显示)
-                REG_WRITE(GPIO_OUT_W1TC_REG, OE_MASK);
-
-                // 位权延时 (bit0=3μs, bit1=6μs, ... bit5=96μs)
+                // ── 阶段3: BCM位权延时 (显示期间) ────────────────────
+                // OE保持LOW，显示继续，直到下一次移位开始
                 delayMicroseconds(baseDelay << bit);
-
-                // 显示结束，禁用输出
-                REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
+                // 注意: 不在此处 OE HIGH! 下一次循环的移位阶段会在
+                // OE LOW (显示中) 的状态下进行，实现移位与显示的重叠。
             }
         }
+        // 帧结束: 消隐后让出CPU
+        REG_WRITE(GPIO_OUT_W1TS_REG, OE_MASK);
         // 每帧结束让出CPU时间给WiFi栈和idle task
         // 使用 vTaskDelay(1) 确保 idle task 可以运行 (喂系统看门狗)
         vTaskDelay(1);
