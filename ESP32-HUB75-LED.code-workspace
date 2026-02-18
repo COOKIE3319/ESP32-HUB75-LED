@@ -1,0 +1,12 @@
+{
+	"folders": [
+		{
+			"name": "ESP32-HUB75-LED",
+			"path": "."
+		},
+		{
+			"path": "../ESP32-HUB75-LED-WebUI"
+		}
+	],
+	"settings": {}
+}
